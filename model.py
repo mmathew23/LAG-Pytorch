@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+from torch.autograd import Variable
 
 def get_upsample_filters(min_filters, max_filters, upsample_layers):
     upsample_filters = [max_filters] + [max(min_filters, max_filters >> layer) for layer in range(1, upsample_layers+1)]
@@ -76,9 +76,11 @@ class Generator(nn.Module):
         self.upsample_layers = nn.Sequential(*[UpsampleBlock(upsample_filters[layer], upsample_filters[layer+1]) for layer, fil in enumerate(upsample_filters[:-1])])
 
 
-    def forward(self, x, noise_scale=1):
+    def forward(self, x, noise_scale=1, eps=None):
         b, c, h, w = x.shape
-        eps = torch.randn(b, self.noise_dim, h, w, device=x.device)
+        if not eps:
+            eps = torch.randn(b, self.noise_dim, h, w, device=x.device)
+        eps *= noise_scale
         x = self.conv1(torch.cat([x, eps], dim=1))
 
         x = self.residual_blocks(x)
@@ -115,7 +117,7 @@ class DownsampleBlock(nn.Module):
         if stage == 0:
             self.downscale = nn.Identity()
         else:
-            self.downscale = nn.AvgPool2d((stage)*2) #we can play with this to see what downscale operator works best
+            self.downscale = nn.AvgPool2d(2**stage) #we can play with this to see what downscale operator works best
 
         self.conv1 = nn.Conv2d(filter1, filter1, 3)
         self.space_to_channels = SpaceToChannel()
@@ -156,7 +158,7 @@ class Discriminator(nn.Module):
 
         self.center = torch.ones((1, max_filters, 1, 1))
         self.center[:,::2,:,:] = -1
-        self.center.requires_grad = False
+        self.center.requires_grad = False #I don't think this needs to be here
 
     def forward(self, x, lowres_x_delta):
         y_0 = torch.zeros(x.shape)
@@ -171,7 +173,80 @@ class Discriminator(nn.Module):
 
 
 class GAN(object):
-    def __init__(self, max_filters=256, min_filters=64, upsample_layers=3, noise_dim=64, blocks=8):
-        pass
+    def __init__(self, max_filters=256, min_filters=64, upsample_layers=3, noise_dim=64, blocks=8, device_id=0):
+        self.device = f'cuda:{device_id}'
+        self.noise_dim = noise_dim
+        self.upsample_layers = upsample_layers
+        self.G = Generator( max_filters=max_filters, min_filters=min_filters,
+                upsample_layers=upsample_layers, noise_dim=noise_dim, blocks=blocks).cuda(self.device)
+        self.D = Discriminator(max_filters=max_filters, min_filters=min_filters,
+                upsample_layers=upsample_layers, blocks=blocks).cuda(self.device)
 
+        self.downscale = nn.AvgPool2d(2**self.upsample_layers)
+        #currently no ema
 
+    def straight_through_round(self, x, r=127.5/4):
+        xr = torch.round(x*r)/r
+        dxr = xr - x
+        dxr.requires_grad = False
+        return dxr + x
+
+    def train(self, dataloader, epochs, lr, wass_target, mse_weight):
+        self.G.train()
+        self.D.train()
+        G_opt = torch.optim.Adam(self.G.parameters(), lr=lr)
+        D_opt = torch.optim.Adam(self.D.parameters(), lr=lr)
+        #iterate through loader
+        for epoch in range(epochs):
+            for i, batch in enumerate(dataloader):
+                lores, real = batch
+                lores.cuda(self.device)
+                real.cuda(self.device)
+
+                G_opt.zero_grad()
+                D_opt.zero_grad()
+
+                #gen noise
+                b, c, h, w = lores.shape
+                eps = torch.randn(b, self.noise_dim, h, w, device=self.device)
+                #gen fake no noise
+                fake = self.G(lores)
+                #gen fake plus noise
+                fake_eps = self.G(lores, eps=eps)
+
+                #downscale fake no noise and fake with noise
+                lores_fake = self.downscale(fake)
+                lores_fake_eps = self.downscale(fake_eps)
+                # disc real, fake, fake with noise
+                latent_real = self.D(real, torch.zeros_like(lores))
+                #not sure why they don't use zeroes above
+                #latent_real = self.D(real, self.straight_through_round(torch.abs(lores-lores)))
+                latent_fake = self.D(fake, self.straight_through_round(torch.abs(lores - lores_fake)))
+                latent_fake_eps = self.D(fake_eps, self.straight_through_round(torch.abs(lores - lores_fake_eps)))
+                #disc mixed for gradient penalty
+                uniform_mix = torch.rand(b, 1, 1, 1)
+                mixed = real + uniform_mix * (fake_eps - real)
+                mixed_round = self.straight_round_through(torch.abs(lores - self.downscale(mixed)))
+
+                xs = Variable(mixed, requires_grad=True)
+                ys = torch.sum(torch.mean(self.D(xs, mixed_round), dim=1))
+                grad = torch.autograd.grad(ys, xs)[0]
+                print('grad', grad.shape)
+                grad_norm = torch.sqrt(torch.mean(torch.square(grad), dim=[1,2,3])+1e-8)
+                #calc losses
+                loss_dreal = -torch.mean(latent_real)
+                loss_dfake = torch.mean(latent_fake_eps)
+                loss_gfake = -torch.mean(latent_fake_eps)
+                loss_gmse = nn.functional.mse_loss(latent_real, latent_fake)
+                loss_gp = 10 * torch.mean(torch.square(grad_norm - wass_target)) * wass_target ** -2
+
+                loss_disc = loss_dreal + loss_dfake + loss_gp
+                loss_gen = loss_gfake + mse_weight * loss_gmse
+
+                # opt step
+                loss_gen.backward()
+                loss_disc.backward()
+                G_opt.step()
+                D_opt.step()
+                if epoch%10 == 0 and i == 0:
+                    print(f'Epoch: {epoch}. Loss: {loss_gen} {loss_disc}')
