@@ -29,12 +29,12 @@ class ResidualBlock(nn.Module):
 
         self.conv1 = nn.Conv2d(num_filters, num_filters, 3, padding=1)
         self.activation = activation
-        self.first = nn.Sequential(self.conv1, self.activation)
         self.conv2 = nn.Conv2d(num_filters, num_filters, 3, padding=1)
+        self.first = nn.Sequential(self.conv1, self.activation, self.conv2)
 
     def forward(self, x):
         dx = self.first(x)
-        dx = self.conv2(dx)
+        #dx = self.conv2(dx)
 
         return x + dx
 
@@ -50,12 +50,21 @@ class UpsampleBlock(nn.Module):
         self.block = nn.Sequential(self.upsample, self.conv1, self.activation, self.conv2, self.activation)
 
         self.rgb = nn.Conv2d(out_filter, 3, 3, padding=1)
+        self.upsample = nn.UpsamplingNearest2d(scale_factor=2)
 
     def forward(self, x):
-        y = self.block(x)
+        #x should be a tuple
+        y, rgb_in = x
+        y = self.block(y)
 
-        #we may want to hook into this to grab y for rgb conversion later
-        return y, self.rgb(y)
+        rgb_out = self.rgb(y)
+
+        if rgb_in is None:
+            return y, rgb_out
+        else:
+            up = self.upsample(rgb_in) + rgb_out
+            return y, up
+
 
 class Generator(nn.Module):
     """
@@ -101,13 +110,15 @@ class Generator(nn.Module):
 
         x = self.residual_blocks(x)
 
-        for i, layer in enumerate(self.upsample_layers):
-            x, rgb = layer(x)
-            if i == 0:
-                im = rgb
-            else:
-                im = self.upsample(im) + rgb
+        #for i, layer in enumerate(self.upsample_layers):
+        #    x, rgb = layer(x)
+        #    if i == 0:
+        #        im = rgb
+        #    else:
+        #        im = self.upsample(im) + rgb
 
+        #return im
+        y, im = self.upsample_layers((x, None))
         return im
 
 
@@ -139,15 +150,17 @@ class DownsampleBlock(nn.Module):
         self.conv1 = nn.Conv2d(filter1, filter1, 3, padding=1)
         self.space_to_channels = SpaceToChannel()
         self.conv2 = nn.Conv2d(4*filter1, filter2, 3, padding=1) #4* since we rearrange space onto channels
+        self.seq1 = nn.Sequential(self.conv1, self.leaky, self.space_to_channels, self.conv2, self.leaky)
 
     def forward(self, x):
         x0, y = x #unpack original image and y
 
         #initial y in Downsampleblock should be a tensor of 0's
         y += self.from_rgb(self.downscale(x0))
-        y = self.leaky(self.conv1(y))
-        y = self.space_to_channels(y)
-        y = self.leaky(self.conv2(y))
+        #y = self.leaky(self.conv1(y))
+        #y = self.space_to_channels(y)
+        #y = self.leaky(self.conv2(y))
+        y = self.seq1(y)
         return x0, y
 
 
@@ -230,11 +243,13 @@ class GAN(object):
         self.D.load_state_dict(torch.load(D_name))
 
     def train(self, dataloader, epochs, lr, wass_target, mse_weight, ttur, save_every=1):
+        #torch.backends.cudnn.benchmark = True
+        #torch.autograd.set_detect_anomaly(True)
         self.G.train()
         self.D.train()
         #epsilon value is the tensorflow default, could probably take this out
-        G_opt = torch.optim.Adam(self.G.parameters(), lr=lr, betas=(0, 0.99), eps=1e-7)
-        D_opt = torch.optim.Adam(self.D.parameters(), lr=lr, betas=(0, 0.99), eps=1e-7)
+        G_opt = torch.optim.Adam(self.G.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-7)
+        D_opt = torch.optim.Adam(self.D.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-7)
         #iterate through loader
         for epoch in range(epochs):
             for i, batch in enumerate(dataloader):
@@ -256,12 +271,23 @@ class GAN(object):
                 #downscale fake no noise and fake with noise
                 lores_fake = self.downscale(fake)
                 lores_fake_eps = self.downscale(fake_eps)
+
                 # disc real, fake, fake with noise
-                latent_real = self.D(real, torch.zeros_like(lores))
-                #not sure why they don't use zeroes above
-                #latent_real = self.D(real, self.straight_through_round(torch.abs(lores-lores)))
+                #not sure why they don't use zeroes
+                #latent_real = self.D(real, torch.zeros_like(lores))
+                latent_real = self.D(real, self.straight_through_round(torch.abs(lores-lores)))
                 latent_fake = self.D(fake, self.straight_through_round(torch.abs(lores - lores_fake)))
                 latent_fake_eps = self.D(fake_eps, self.straight_through_round(torch.abs(lores - lores_fake_eps)))
+                #loss for G
+                loss_gfake = -torch.mean(latent_fake_eps)
+                loss_gmse = nn.functional.mse_loss(latent_real, latent_fake)
+                loss_gen = loss_gfake + mse_weight * loss_gmse
+
+                #G backward and opt step
+                loss_gen.backward(retain_graph=True)
+                G_opt.step()
+                loss_gen = float(loss_gen)
+
                 #disc mixed for gradient penalty
                 uniform_mix = torch.rand(b, 1, 1, 1).cuda(self.device)
                 mixed = real + uniform_mix * (fake_eps - real)
@@ -270,28 +296,25 @@ class GAN(object):
                 xs = Variable(mixed, requires_grad=True)
                 ys = torch.sum(torch.mean(self.D(xs, mixed_round), dim=1))
                 grad = torch.autograd.grad(ys, xs)[0]
-                grad_norm = torch.sqrt(torch.mean(grad*grad, dim=[1,2,3])+1e-8)
-                #calc losses
+                grad= torch.sqrt(torch.mean(grad*grad, dim=[1,2,3])+1e-8)
+                #calc losses for D
                 loss_dreal = -torch.mean(latent_real)
                 loss_dfake = torch.mean(latent_fake_eps)
-                loss_gfake = -torch.mean(latent_fake_eps)
-                loss_gmse = nn.functional.mse_loss(latent_real, latent_fake)
-                loss_gp = 10 * torch.mean((grad_norm - wass_target)*(grad_norm-wass_target)) * wass_target ** -2
+                loss_gp = 10 * torch.mean((grad- wass_target)*(grad-wass_target)) * wass_target ** -2
 
                 loss_disc = ttur * (loss_dreal + loss_dfake + loss_gp)
-                loss_gen = loss_gfake + mse_weight * loss_gmse
                 #print(loss_dreal, loss_dfake, loss_gfake, loss_gmse, loss_gp)
                 # opt step
-                loss_gen.backward(retain_graph=True)
                 loss_disc.backward()
-                G_opt.step()
+                loss_disc = float(loss_disc)
                 D_opt.step()
+
                 n_iter = (epoch)*len(dataloader)+i
-                if i%50 == 0 and (epoch !=0 and i==0):
-                    print(f'Epoch: {epoch}. Loss: {loss_gen} {loss_disc}')
+                if i%50 == 0:
+                    print(f'Epoch: {epoch}. Loss: GLoss: {loss_gen} DLoss: {loss_disc} gfake: {loss_gfake} gmse: {loss_gmse} dreal: {loss_dreal} dfake: {loss_dfake} gp: {loss_gp}')
                     log_loss(self.log_writer, n_iter, loss_dreal, loss_dfake, loss_gfake, loss_gmse, loss_gp, loss_disc, loss_gen)
                     log_image(self.log_writer, n_iter, real, lores, fake, fake_eps)
 
-                if n_iter%self.save_every == 0:
+                if n_iter%self.save_every == 0 and (epoch !=0 and i==0):
                     self.save(n_iter)
 

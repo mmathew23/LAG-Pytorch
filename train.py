@@ -42,7 +42,7 @@ def train(
         dataset = LargeImageDataset(root_path, downsample=2**upsample_layers, size=image_size)
         datasetname='largeimage'
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=batch_shuffle)
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=batch_shuffle, pin_memory=False)
     model_name = f'{model_name_prefix}.{datasetname}.{epochs}.{batch_size}.{lr}.{max_filters}.{min_filters}.{upsample_layers}.{blocks}.{noise_dim}.{image_size}.{wass_target}.{ttur}.{mse_weight}'
 
     if not os.path.exists(models_dir):
