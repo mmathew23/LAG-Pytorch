@@ -18,7 +18,7 @@ def train(
         noise_dim=64,
         blocks=8,
         device_id=0,
-        image_size=512,
+        image_size=256,
         batch_shuffle=True,
         num_workers=4,
         wass_target=1,

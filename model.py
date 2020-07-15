@@ -121,7 +121,8 @@ class SpaceToChannel(nn.Module):
         b, c, h, w = x.shape
         x = x.reshape(-1, c, h//self.n, self.n, w//self.n, self.n)
         x = x.permute(0, 1, 3, 5, 2, 4)
-        return x.reshape(-1, c*self.n*self.n, h//self.n, w//self.n)
+        x = x.reshape(-1, c*self.n*self.n, h//self.n, w//self.n)
+        return x
 
 class DownsampleBlock(nn.Module):
     def __init__(self, stage, filter1, filter2, negative_slope=0.2):
@@ -143,7 +144,6 @@ class DownsampleBlock(nn.Module):
         x0, y = x #unpack original image and y
 
         #initial y in Downsampleblock should be a tensor of 0's
-        temp = self.from_rgb(self.downscale(x0))
         y += self.from_rgb(self.downscale(x0))
         y = self.leaky(self.conv1(y))
         y = self.space_to_channels(y)
@@ -287,7 +287,7 @@ class GAN(object):
                 G_opt.step()
                 D_opt.step()
                 n_iter = (epoch)*len(dataloader)+i
-                if i%50 == 0:
+                if i%50 == 0 and (epoch !=0 and i==0):
                     print(f'Epoch: {epoch}. Loss: {loss_gen} {loss_disc}')
                     log_loss(self.log_writer, n_iter, loss_dreal, loss_dfake, loss_gfake, loss_gmse, loss_gp, loss_disc, loss_gen)
                     log_image(self.log_writer, n_iter, real, lores, fake, fake_eps)
