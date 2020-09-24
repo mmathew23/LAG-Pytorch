@@ -8,9 +8,23 @@ import os
 import random
 
 denorm = transforms.Compose([
-    transforms.Normalize([0,0,0], [1/0.229, 1/0.224, 1/0.225]),
-    transforms.Normalize([-0.485, -0.456, -0.406], [1,1,1]),
+    transforms.Normalize([0,0,0], [2.0, 2.0, 2.0]),
+    transforms.Normalize([-0.5, -0.5, -0.5], [1,1,1]),
     ])
+
+
+def get_augmentation_transforms(horizontal_flip=True, vertical_flip=False, brightness=0, contrast=0,
+        saturation=0, hue=0, color_probability=0.1):
+    data_augmentation = []
+    if brightness or contrast or saturation or hue:
+        data_augmentation.append(transforms.RandomApply((transforms.ColorJitter(brightness, contrast,
+            saturation, hue),),  color_probability))
+    if horizontal_flip:
+        data_augmentation.append(transforms.RandomHorizontalFlip())
+    if vertical_flip:
+        data_augmentation.append(transforms.RandomVerticalFlip())
+
+    return transforms.Compose(data_augmentation)
 
 #We can use either many images or one large resolution image and sample tiles from it
 
@@ -28,21 +42,24 @@ class FolderDatasetDownsample(Dataset):
         self.files = glob.glob(self.root+'/*')
         self.len = len(self.files)
         self.size = size
-        self.resize_full = transforms.Resize(size, size)
+        #self.resize_full = transforms.Resize((size, size))
+        self.resize_full = transforms.CenterCrop(size)
         down_size = int(size/downsample)
-        self.resize_down = transforms.Resize(down_size, down_size)
+        self.resize_down = transforms.Resize((down_size, down_size), Image.BOX)
+        self.augmentations = get_augmentation_transforms(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05)
         self.transforms = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]), #normalize to imagenet stats maybe change
+            transforms.Normalize([.5,.5,.5], [.5,.5,.5]) #range [-1,1]
             ])
 
-    def __len(self):
+    def __len__(self):
         return self.len
 
     def __getitem__(self, index):
         f = self.files[index]
         img = Image.open(os.path.join(self.root, f)).convert('RGB')
-        raw_x, raw_y = self.resize_down(img), self.resize_full(img)
+        aug_img = self.resize_full(self.augmentations(img))
+        raw_x, raw_y = self.resize_down(aug_img), aug_img
         transformed_x, transformed_y = self.transforms(raw_x), self.transforms(raw_y)
         return transformed_x, transformed_y
 
@@ -75,19 +92,23 @@ class LargeImageDataset(Dataset):
         self.rows = (h-size+1)
         self.size = size
         self.downsize = int(size/downsample)
-        down_size_h = int(h/downsample)
-        down_size_w = int(w/downsample)
-        self.resize_down = transforms.Resize((down_size_h, down_size_w), Image.BICUBIC)
-        self.transforms = transforms.Compose([
-            transforms.ToTensor(),
-            #transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]), #normalize to imagenet stats maybe change
+        self.tensor_transform = transforms.ToTensor()
+        self.augmentations = get_augmentation_transforms(vertical_flip=True,
+                brightness=0.05, contrast=0.05, saturation=0.05, hue=0.05)
+        self.first_transforms = transforms.Compose([
+                transforms.ToPILImage(),
+                self.augmentations,
             ])
-        #self.lores = self.transforms(self.resize_down(self.img))
-        self.sres = self.transforms(self.img)
+        self.resize_down = transforms.Resize((self.downsize, self.downsize), Image.BOX)
+        self.tenorm_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([.5,.5,.5], [.5,.5,.5]) #range [-1,1]
+            ])
+        self.sres = self.tensor_transform(self.img)
 
     def indexToTilePos(self, index):
         #we will order like a matrix
-        row = index // self.rows
+        row = index // self.cols
         col = index % self.cols
         return (row, col)
 
@@ -97,16 +118,11 @@ class LargeImageDataset(Dataset):
     def __getitem__(self, index):
         tilePos = self.indexToTilePos(index)
         row, col = tilePos
-        normalize_transforms = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) #normalize to imagenet stats maybe change
 
-        down_transforms = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((self.downsize, self.downsize), Image.BICUBIC),
-                transforms.ToTensor(),
-                normalize_transforms
-            ])
-        lores = down_transforms(self.sres[:,row:row+self.size, col:col+self.size])
-        return lores, normalize_transforms(self.sres[:,row:row+self.size, col:col+self.size])
+        img = self.first_transforms(self.sres[:,row:row+self.size, col:col+self.size])
+
+        lores = self.tenorm_transform(self.resize_down(img))
+        return lores, self.tenorm_transform(img)
 
 
     def name(self):
